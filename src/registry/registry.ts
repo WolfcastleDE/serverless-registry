@@ -26,6 +26,11 @@ const registryConfiguration = z
 export type RegistryConfiguration = z.infer<typeof registryConfiguration>;
 
 export function registries(env: Env): RegistryConfiguration[] {
+  // Anonymous clients must not be able to make us copy arbitrary upstream images into R2
+  if (env.ANONYMOUS_REQUEST) {
+    return [];
+  }
+
   if (env.REGISTRIES_JSON === undefined || env.REGISTRIES_JSON.length === 0) {
     return [];
   }

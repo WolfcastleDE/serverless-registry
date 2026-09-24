@@ -14,6 +14,7 @@ import { env } from "cloudflare:workers";
 import { createExecutionContext, reset, waitOnExecutionContext } from "cloudflare:test";
 import { base64UrlEncode } from "../src/utils";
 import { isCacheableKey } from "../src/registry/regional-cache";
+import { anonymousPullPatterns, anonymousPullRepository } from "../src/anonymous";
 
 afterEach(async () => {
   await reset();
@@ -2688,6 +2689,101 @@ describe("regional cache", () => {
     await createManifest("cached-push", await generateManifest("cached-push"), "latest");
     expect((await bindings.REGISTRY_CACHE_EU!.list({ prefix: "cached-push/" })).objects.length).toBe(0);
     expect((await bindings.REGISTRY_CACHE_US!.list({ prefix: "cached-push/" })).objects.length).toBe(0);
+  });
+});
+
+describe("anonymous pulls", () => {
+  async function anonFetch(method: string, path: string, repositories: string | undefined, headers = {}) {
+    const ctx = createExecutionContext();
+    const res = (await worker.fetch(
+      createRequest(method, path, null, headers),
+      { ...env, ANONYMOUS_PULL_REPOSITORIES: repositories } as Env,
+      ctx,
+    )) as Response;
+    await waitOnExecutionContext(ctx);
+    return res;
+  }
+
+  test("patterns", () => {
+    const e = (v: string) => ({ ANONYMOUS_PULL_REPOSITORIES: v }) as Env;
+    expect(anonymousPullPatterns(e("")).length).toBe(0);
+    expect(anonymousPullPatterns(e(" a/b, c/*  d ")).map((r) => r.source)).toEqual(["^a\\/b$", "^c\\/.*$", "^d$"]);
+    const r = (path: string, method = "GET") =>
+      anonymousPullRepository(e("org/*,single"), new Request(`https://registry.com${path}`, { method }));
+    const digest = `sha256:${"a".repeat(64)}`;
+    expect(r("/v2/org/app/manifests/latest")).toBe("org/app");
+    expect(r("/v2/org/deep/app/manifests/latest", "HEAD")).toBe("org/deep/app");
+    expect(r(`/v2/org/app/blobs/${digest}`)).toBe("org/app");
+    expect(r("/v2/org/app/tags/list")).toBe("org/app");
+    expect(r(`/v2/org/app/referrers/${digest}`)).toBe("org/app");
+    expect(r("/v2/single/manifests/1")).toBe("single");
+    expect(r("/v2/single2/manifests/1")).toBeNull();
+    expect(r("/v2/other/app/manifests/latest")).toBeNull();
+    expect(r("/v2/org/app/manifests/latest", "PUT")).toBeNull();
+    expect(r("/v2/org/app/blobs/uploads/some-uuid")).toBeNull();
+    expect(r("/v2/org/app/blobs/uploads")).toBeNull();
+    expect(r("/v2/")).toBeNull();
+    expect(r("/v2/_catalog")).toBeNull();
+  });
+
+  test("allowed repositories can be pulled without credentials", async () => {
+    const manifest = await generateManifest("public/app");
+    const { sha256 } = await createManifest("public/app", manifest, "latest");
+    const layer = getLayersFromManifest(manifest)[1];
+
+    expect((await anonFetch("GET", "/v2/public/app/manifests/latest", "public/*")).status).toBe(200);
+    expect((await anonFetch("HEAD", `/v2/public/app/manifests/${sha256}`, "public/*")).status).toBe(200);
+    const blob = await anonFetch("GET", `/v2/public/app/blobs/${layer}`, "public/*");
+    expect(blob.status).toBe(200);
+    expect(blob.headers.get("docker-content-digest")).toBe(layer);
+    expect((await anonFetch("HEAD", `/v2/public/app/blobs/${layer}`, "public/*")).status).toBe(200);
+    expect((await anonFetch("GET", "/v2/public/app/tags/list", "public/*")).status).toBe(200);
+    // unknown objects in allowed repositories are a normal 404, not an auth error
+    expect((await anonFetch("GET", "/v2/public/app/manifests/missing", "public/*")).status).toBe(404);
+  });
+
+  test("everything else still needs credentials", async () => {
+    await createManifest("private/app", await generateManifest("private/app"), "latest");
+    await createManifest("public/app", await generateManifest("public/app"), "latest");
+
+    // feature off
+    expect((await anonFetch("GET", "/v2/public/app/manifests/latest", undefined)).status).toBe(401);
+    expect((await anonFetch("GET", "/v2/public/app/manifests/latest", "")).status).toBe(401);
+    // other repository
+    expect((await anonFetch("GET", "/v2/private/app/manifests/latest", "public/*")).status).toBe(401);
+    // the ping keeps its Basic challenge so docker still sends credentials for pushes
+    const ping = await anonFetch("GET", "/v2/", "*");
+    expect(ping.status).toBe(401);
+    expect(ping.headers.get("WWW-Authenticate")).toContain("Basic");
+    expect((await anonFetch("GET", "/v2/_catalog", "*")).status).toBe(401);
+    // writes
+    expect((await anonFetch("POST", "/v2/public/app/blobs/uploads/", "*")).status).toBe(401);
+    expect((await anonFetch("PUT", "/v2/public/app/manifests/latest", "*")).status).toBe(401);
+    expect((await anonFetch("DELETE", "/v2/public/app/manifests/latest", "*")).status).toBe(401);
+    expect((await anonFetch("POST", "/v2/public/app/gc", "*")).status).toBe(401);
+    // wrong credentials are rejected even for public repositories
+    expect(
+      (
+        await anonFetch("GET", "/v2/public/app/manifests/latest", "*", {
+          Authorization: usernamePasswordToAuth("hello", "wrong"),
+        })
+      ).status,
+    ).toBe(401);
+  });
+
+  test("anonymous requests never use the pull fallback", () => {
+    const withFallback = { ...env, REGISTRIES_JSON: '[{ "registry": "https://ghcr.io" }]' } as Env;
+    expect(registries(withFallback).length).toBe(1);
+    expect(registries({ ...withFallback, ANONYMOUS_REQUEST: true }).length).toBe(0);
+  });
+
+  test("requests do not modify the shared env", async () => {
+    const shared = { ...env, ANONYMOUS_PULL_REPOSITORIES: "*" } as Env;
+    const ctx = createExecutionContext();
+    await worker.fetch(createRequest("GET", "/v2/public/app/tags/list", null), shared, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(shared.REGISTRY_CLIENT).toBeUndefined();
+    expect(shared.ANONYMOUS_REQUEST).toBeUndefined();
   });
 });
 
