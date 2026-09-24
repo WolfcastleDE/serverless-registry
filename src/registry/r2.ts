@@ -535,17 +535,9 @@ export class R2Registry implements Registry {
         response: new ManifestError("MANIFEST_INVALID", `invalid subject digest ${subjectDigest}`),
       };
     }
-    if (subjectDigest !== undefined) {
-      const [subjectManifest, subjectManifestErr] = await wrap(env.REGISTRY.head(`${name}/manifests/${subjectDigest}`));
-      if (subjectManifestErr) {
-        return wrapError("putManifestInner", subjectManifestErr);
-      }
-      if (subjectManifest === null) {
-        return {
-          response: new ManifestError("BLOB_UNKNOWN", `unknown subject ${subjectDigest}`),
-        };
-      }
-    }
+    // The subject does not have to exist yet: the OCI distribution spec (v1.1) allows pushing a
+    // referrer before its subject, and copy tools like regsync push the manifests of an index in
+    // parallel, so buildx attestations regularly arrive before the image they describe.
 
     const referrerDescriptor = descriptorFromManifest(manifest, digestStr, blob.size);
     if (checkLayers) {

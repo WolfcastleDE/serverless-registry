@@ -1102,7 +1102,7 @@ describe("v2 referrers", () => {
     expect(response.status).toEqual(400);
   });
 
-  test("PUT /v2/:name/manifests/:reference rejects missing local subjects", async () => {
+  test("PUT /v2/:name/manifests/:reference accepts referrers pushed before their subject", async () => {
     const name = "referrers-missing-subject";
     const bindings = env as Env;
     const missingSubjectDigest = numberedDigest(4500);
@@ -1123,13 +1123,14 @@ describe("v2 referrers", () => {
       }),
     );
 
-    expect(response.status).toEqual(400);
-    expect((await response.json()) as { errors: { code: string; message: string }[] }).toEqual({
-      errors: [expect.objectContaining({ code: "BLOB_UNKNOWN", message: `unknown subject ${missingSubjectDigest}` })],
-    });
-    expect(await bindings.REGISTRY.head(`${name}/manifests/artifact`)).toBeNull();
-    expect(await bindings.REGISTRY.head(`${name}/manifests/${artifactDigest}`)).toBeNull();
-    expect(await bindings.REGISTRY.head(`${name}/_referrers/${missingSubjectDigest}/${artifactDigest}`)).toBeNull();
+    expect(response.status).toEqual(201);
+    expect(response.headers.get("OCI-Subject")).toEqual(missingSubjectDigest);
+    expect(await bindings.REGISTRY.head(`${name}/manifests/artifact`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${artifactDigest}`)).not.toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/_referrers/${missingSubjectDigest}/${artifactDigest}`)).not.toBeNull();
+
+    const referrers = await getReferrersIndex(name, missingSubjectDigest);
+    expect(referrers.body.manifests.map((m) => m.digest)).toEqual([artifactDigest]);
   });
 
   test("PUT /v2/:name/manifests/:reference rejects invalid subject-bearing OCI indexes", async () => {
