@@ -3,6 +3,7 @@ import { InternalError } from "../errors";
 import { errorString } from "../utils";
 import z from "zod";
 import { GarbageCollectionMode } from "./garbage-collector";
+import type { CacheStatus } from "./regional-cache";
 
 // Defines a registry and how it's configured
 const registryConfiguration = z
@@ -50,6 +51,7 @@ export type CheckManifestResponse =
       size: number;
       digest: string;
       contentType: string;
+      cacheStatus?: CacheStatus;
     }
   | {
       exists: false;
@@ -66,6 +68,7 @@ export type CheckLayerResponse =
       exists: true;
       size: number;
       digest: string;
+      cacheStatus?: CacheStatus;
     }
   | {
       exists: false;
@@ -97,6 +100,7 @@ export type GetManifestResponse = {
   digest: string;
   size: number;
   contentType: string;
+  cacheStatus?: CacheStatus;
 };
 
 // returned by getLayer when it successfully retrieves a layer
@@ -104,6 +108,7 @@ export type GetLayerResponse = {
   stream: ReadableStream;
   digest: string;
   size: number;
+  cacheStatus?: CacheStatus;
 };
 
 export type ReferrerDescriptor = {

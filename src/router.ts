@@ -19,6 +19,14 @@ import {
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
 import { ociImageIndexContentType } from "./registry/r2";
+import { CacheStatus, cacheStatusHeader, invalidateCaches } from "./registry/regional-cache";
+
+// Responses that came from a fallback registry (REGISTRIES_JSON) instead of our buckets
+const upstreamCacheStatus = "upstream";
+
+function cacheHeaders(status: CacheStatus | typeof upstreamCacheStatus | undefined): Record<string, string> {
+  return status ? { [cacheStatusHeader]: status } : {};
+}
 
 const maxReferrersListLimit = 1000;
 const isOpaqueReferrersCursor = (cursor: string) => cursor.startsWith("/v2/");
@@ -127,6 +135,8 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
   // index entry if it points at another subject.
   await env.REGISTRY.delete(`${name}/manifests/${reference}`);
   if (reference === manifestDigest) {
+    // Only manifests by digest live in the regional caches, tags are always read from the primary bucket
+    await invalidateCaches(env, `${name}/manifests/${manifestDigest}`);
     if (subjectDigest !== undefined && isValidDigest(subjectDigest)) {
       await env.REGISTRY.delete(`${name}/_referrers/${subjectDigest}/${manifestDigest}`);
     }
@@ -148,6 +158,7 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
         "Content-Length": res.size.toString(),
         "Content-Type": res.contentType,
         "Docker-Content-Digest": res.digest,
+        ...cacheHeaders(res.cacheStatus),
       },
     });
   }
@@ -207,6 +218,7 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
       "Content-Length": checkManifestResponse.size.toString(),
       "Content-Type": checkManifestResponse.contentType,
       "Docker-Content-Digest": checkManifestResponse.digest,
+      ...cacheHeaders(upstreamCacheStatus),
     },
   });
 });
@@ -220,6 +232,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
         "Content-Length": res.size.toString(),
         "Content-Type": res.contentType,
         "Docker-Content-Digest": res.digest,
+        ...cacheHeaders(res.cacheStatus),
       },
     });
   }
@@ -270,6 +283,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
       "Content-Length": getManifestResponse.size.toString(),
       "Content-Type": getManifestResponse.contentType,
       "Docker-Content-Digest": getManifestResponse.digest,
+      ...cacheHeaders(upstreamCacheStatus),
     },
   });
 });
@@ -366,6 +380,7 @@ v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionCo
       headers: {
         "Docker-Content-Digest": res.digest,
         "Content-Length": `${res.size}`,
+        ...cacheHeaders(res.cacheStatus),
       },
     });
   }
@@ -404,6 +419,7 @@ v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionCo
     headers: {
       "Docker-Content-Digest": layerResponse.digest,
       "Content-Length": `${layerResponse.size}`,
+      ...cacheHeaders(upstreamCacheStatus),
     },
   });
 });
@@ -590,9 +606,14 @@ v2Router.put("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
 v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
   const { name, tag } = req.params;
 
-  const res = await env.REGISTRY.head(`${name}/blobs/${tag}`);
+  const res = await env.REGISTRY_CLIENT.layerExists(name, tag);
+  if ("response" in res) {
+    return res.response;
+  }
+
   let layerExistsResponse: CheckLayerResponse | null = null;
-  if (!res) {
+  let cacheStatus: CacheStatus | typeof upstreamCacheStatus | undefined = undefined;
+  if (!res.exists) {
     const registryList = registries(env);
     for (const registry of registryList) {
       const client = new RegistryHTTPClient(env, registry);
@@ -603,6 +624,7 @@ v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
 
       if (response.exists) {
         layerExistsResponse = response;
+        cacheStatus = upstreamCacheStatus;
         break;
       }
     }
@@ -610,21 +632,15 @@ v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
     if (layerExistsResponse === null || !layerExistsResponse.exists)
       return new Response(JSON.stringify(BlobUnknownError), { status: 404 });
   } else {
-    if (res.checksums.sha256 === null) {
-      throw new ServerError("invalid checksum from R2 backend");
-    }
-
-    layerExistsResponse = {
-      digest: hexToDigest(res.checksums.sha256!),
-      size: res.size,
-      exists: true,
-    };
+    layerExistsResponse = res;
+    cacheStatus = res.cacheStatus;
   }
 
   return new Response(null, {
     headers: {
       "Content-Length": layerExistsResponse.size.toString(),
       "Docker-Content-Digest": layerExistsResponse.digest,
+      ...cacheHeaders(cacheStatus),
     },
   });
 });
@@ -694,6 +710,7 @@ v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {
   }
 
   await env.REGISTRY.delete(`${name}/blobs/${digest}`);
+  await invalidateCaches(env, `${name}/blobs/${digest}`);
   return new Response(null, {
     status: 202,
     headers: {

@@ -13,7 +13,11 @@
       },
     },
     "dev": {
-      "r2_buckets": [{ "binding": "REGISTRY", "bucket_name": "r2-image-registry-dev" }],
+      "r2_buckets": [
+        { "binding": "REGISTRY", "bucket_name": "r2-image-registry-dev" },
+        { "binding": "REGISTRY_CACHE_EU", "bucket_name": "r2-image-registry-dev-eu" },
+        { "binding": "REGISTRY_CACHE_US", "bucket_name": "r2-image-registry-dev-us" },
+      ],
       "vars": {
         "USERNAME": "hello",
         "PASSWORD": "world",

@@ -6,6 +6,8 @@
 import { ManifestSchema } from "../manifest";
 import { hexToDigest } from "../user";
 import { symlinkHeader } from "./r2";
+import { Env } from "../..";
+import { invalidateCaches, isCacheableKey } from "./regional-cache";
 
 export type GarbageCollectionMode = "unreferenced" | "untagged";
 export type GCOptions = {
@@ -39,9 +41,18 @@ export type GCOptions = {
 // In the GC code, if there is an insertion on-going, there is an error.
 export class GarbageCollector {
   private registry: R2Bucket;
+  private env?: Env;
 
-  constructor(registry: R2Bucket) {
+  // env is only used to drop deleted objects from the regional cache buckets
+  constructor(registry: R2Bucket, env?: Env) {
     this.registry = registry;
+    this.env = env;
+  }
+
+  private async invalidateRegionalCaches(keys: string[]) {
+    if (this.env) {
+      await invalidateCaches(this.env, keys.filter(isCacheableKey));
+    }
   }
 
   async markForGarbageCollection(namespace: string): Promise<string> {
@@ -312,6 +323,7 @@ export class GarbageCollector {
         }
 
         await this.registry.delete([...keysToDelete]);
+        await this.invalidateRegionalCaches([...keysToDelete]);
       }
     }
 
@@ -388,6 +400,7 @@ export class GarbageCollector {
 
       // GC will delete unreferenced blobs
       await this.registry.delete(unreferencedBlobs.values().toArray());
+      await this.invalidateRegionalCaches(unreferencedBlobs.values().toArray());
     }
 
     return true;

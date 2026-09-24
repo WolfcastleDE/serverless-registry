@@ -31,6 +31,7 @@ import {
 } from "./registry";
 import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
 import { ManifestSchema, manifestSchema } from "../manifest";
+import { RegionalCache } from "./regional-cache";
 
 export const ociImageIndexContentType = "application/vnd.oci.image.index.v1+json";
 
@@ -228,12 +229,28 @@ export async function getUploadState(
 export class R2Registry implements Registry {
   private gc: GarbageCollector;
 
-  constructor(private env: Env) {
-    this.gc = new GarbageCollector(this.env.REGISTRY);
+  constructor(
+    private env: Env,
+    // Regional read-through cache for blobs and manifests by digest. Pushes always go to env.REGISTRY.
+    private cache?: RegionalCache,
+  ) {
+    this.gc = new GarbageCollector(this.env.REGISTRY, this.env);
   }
 
   async manifestExists(name: string, reference: string): Promise<RegistryError | CheckManifestResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.head(`${name}/manifests/${reference}`));
+    const key = `${name}/manifests/${reference}`;
+    const cached = await this.cache?.head(key);
+    if (cached && cached.contentType) {
+      return {
+        exists: true,
+        digest: cached.digest,
+        contentType: cached.contentType,
+        size: cached.size,
+        cacheStatus: "hit",
+      };
+    }
+
+    const [res, err] = await wrap(this.env.REGISTRY.head(key));
     if (err) {
       return wrapError("manifestExists", err);
     }
@@ -253,6 +270,7 @@ export class R2Registry implements Registry {
       digest: hexToDigest(res.checksums.sha256!),
       contentType: res.httpMetadata!.contentType!,
       size: res.size,
+      cacheStatus: "primary",
     };
   }
 
@@ -598,7 +616,22 @@ export class R2Registry implements Registry {
   }
 
   async getManifest(name: string, reference: string): Promise<RegistryError | GetManifestResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/manifests/${reference}`));
+    const key = `${name}/manifests/${reference}`;
+    const cached = await this.cache?.get(key);
+    if (cached && cached.contentType) {
+      return {
+        stream: cached.stream,
+        digest: cached.digest,
+        size: cached.size,
+        contentType: cached.contentType,
+        cacheStatus: "hit",
+      };
+    }
+    if (cached) {
+      await cached.stream.cancel();
+    }
+
+    const [res, err] = await wrap(this.env.REGISTRY.get(key));
     if (err) {
       return wrapError("getManifest", err);
     }
@@ -609,12 +642,22 @@ export class R2Registry implements Registry {
       };
     }
 
-    return {
-      stream: res.body!,
+    const manifest = {
       digest: hexToDigest(res.checksums.sha256!),
       size: res.size,
       contentType: res.httpMetadata!.contentType!,
     };
+    if (this.cache?.applies(key)) {
+      const stream = this.cache.fill(
+        key,
+        res.body!,
+        manifest,
+        async () => (await this.env.REGISTRY.get(key))?.body ?? null,
+      );
+      return { ...manifest, stream, cacheStatus: "miss" };
+    }
+
+    return { ...manifest, stream: res.body!, cacheStatus: "primary" };
   }
 
   async mountExistingLayer(
@@ -664,7 +707,13 @@ export class R2Registry implements Registry {
   }
 
   async layerExists(name: string, tag: string): Promise<RegistryError | CheckLayerResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.head(`${name}/blobs/${tag}`));
+    const key = `${name}/blobs/${tag}`;
+    const cached = await this.cache?.head(key);
+    if (cached) {
+      return { exists: true, digest: cached.digest, size: cached.size, cacheStatus: "hit" };
+    }
+
+    const [res, err] = await wrap(this.env.REGISTRY.head(key));
     if (err) {
       return wrapError("layerExists", err);
     }
@@ -679,10 +728,35 @@ export class R2Registry implements Registry {
       digest: hexToDigest(res.checksums.sha256!),
       size: res.size,
       exists: true,
+      cacheStatus: "primary",
     };
   }
 
   async getLayer(name: string, digest: string): Promise<RegistryError | GetLayerResponse> {
+    const key = `${name}/blobs/${digest}`;
+    const cached = await this.cache?.get(key);
+    if (cached) {
+      return { stream: cached.stream, digest: cached.digest, size: cached.size, cacheStatus: "hit" };
+    }
+
+    const res = await this.getLayerFromPrimary(name, digest);
+    if ("response" in res) {
+      return res;
+    }
+    if (!this.cache?.applies(key)) {
+      return { ...res, cacheStatus: "primary" };
+    }
+
+    // Symlinked (mounted) layers are cached under the requested key with the resolved content,
+    // so a cache hit never has to follow the link through the primary bucket.
+    const stream = this.cache.fill(key, res.stream, res, async () => {
+      const again = await this.getLayerFromPrimary(name, digest);
+      return "response" in again ? null : again.stream;
+    });
+    return { ...res, stream, cacheStatus: "miss" };
+  }
+
+  private async getLayerFromPrimary(name: string, digest: string): Promise<RegistryError | GetLayerResponse> {
     const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`));
     if (err) {
       return wrapError("getLayer", err);
@@ -704,7 +778,7 @@ export class R2Registry implements Registry {
           response: new Response(JSON.stringify(BlobUnknownError), { status: 404 }),
         };
       }
-      return await this.env.REGISTRY_CLIENT.getLayer(linkName, linkDigest);
+      return await this.getLayerFromPrimary(linkName, linkDigest);
     }
 
     return {

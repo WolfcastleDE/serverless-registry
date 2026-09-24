@@ -13,6 +13,7 @@ import worker from "../index";
 import { env } from "cloudflare:workers";
 import { createExecutionContext, reset, waitOnExecutionContext } from "cloudflare:test";
 import { base64UrlEncode } from "../src/utils";
+import { isCacheableKey } from "../src/registry/regional-cache";
 
 afterEach(async () => {
   await reset();
@@ -344,6 +345,7 @@ describe("v2 manifests", () => {
       "content-length": "2",
       "content-type": "application/gzip",
       "docker-content-digest": sha256,
+      "x-registry-cache": "primary",
     });
     await bindings.REGISTRY.delete(`${name}/manifests/${reference}`);
   });
@@ -2508,6 +2510,184 @@ describe("garbage collector", () => {
       const listBlobs = await bindings.REGISTRY.list({ prefix: `${prodName}/blobs/` });
       expect(listBlobs.objects.length).toEqual(0);
     }
+  });
+});
+
+describe("regional cache", () => {
+  function regionalRequest(method: string, path: string, continent: string | undefined) {
+    return new Request(new URL("https://registry.com" + path), {
+      method,
+      headers: { Authorization: usernamePasswordToAuth(username, "world") },
+      cf: continent ? { continent } : undefined,
+    });
+  }
+
+  async function regionalFetch(method: string, path: string, continent: string | undefined, extraEnv = {}) {
+    const ctx = createExecutionContext();
+    const res = (await worker.fetch(
+      regionalRequest(method, path, continent),
+      { ...env, ...extraEnv } as Env,
+      ctx,
+    )) as Response;
+    const body = method === "HEAD" ? "" : await res.text();
+    // wait for the cache fill scheduled via waitUntil
+    await waitOnExecutionContext(ctx);
+    return { res, body };
+  }
+
+  test("only digests are cacheable", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    expect(isCacheableKey(`hello/blobs/${digest}`)).toBe(true);
+    expect(isCacheableKey(`hello/world/manifests/${digest}`)).toBe(true);
+    expect(isCacheableKey(`hello/manifests/latest`)).toBe(false);
+    expect(isCacheableKey(`hello/manifests/sha256:nothex`)).toBe(false);
+    expect(isCacheableKey(`hello/_referrers/${digest}/${digest}`)).toBe(false);
+  });
+
+  test("blobs are read through the regional bucket of the continent", async () => {
+    const bindings = env as Env;
+    const manifest = await generateManifest("cached");
+    await createManifest("cached", manifest, "latest");
+    const layer = getLayersFromManifest(manifest)[1];
+    const primary = await (await bindings.REGISTRY.get(`cached/blobs/${layer}`))!.text();
+
+    for (const [continent, bucket] of [
+      ["EU", bindings.REGISTRY_CACHE_EU!],
+      ["AF", bindings.REGISTRY_CACHE_EU!],
+      ["NA", bindings.REGISTRY_CACHE_US!],
+      ["SA", bindings.REGISTRY_CACHE_US!],
+    ] as const) {
+      await bucket.delete(`cached/blobs/${layer}`);
+      const miss = await regionalFetch("GET", `/v2/cached/blobs/${layer}`, continent);
+      expect(miss.res.status).toBe(200);
+      expect(miss.res.headers.get("x-registry-cache")).toBe("miss");
+      expect(miss.body).toBe(primary);
+      expect(await (await bucket.get(`cached/blobs/${layer}`))!.text()).toBe(primary);
+
+      const hit = await regionalFetch("GET", `/v2/cached/blobs/${layer}`, continent);
+      expect(hit.res.headers.get("x-registry-cache")).toBe("hit");
+      expect(hit.res.headers.get("docker-content-digest")).toBe(layer);
+      expect(hit.res.headers.get("content-length")).toBe(`${primary.length}`);
+      expect(hit.body).toBe(primary);
+
+      const head = await regionalFetch("HEAD", `/v2/cached/blobs/${layer}`, continent);
+      expect(head.res.headers.get("x-registry-cache")).toBe("hit");
+      expect(head.res.headers.get("docker-content-digest")).toBe(layer);
+    }
+  });
+
+  test("asia and unknown locations read the primary bucket", async () => {
+    const bindings = env as Env;
+    const manifest = await generateManifest("cached-asia");
+    await createManifest("cached-asia", manifest, "latest");
+    const layer = getLayersFromManifest(manifest)[1];
+    for (const continent of ["AS", "OC", undefined]) {
+      const res = await regionalFetch("GET", `/v2/cached-asia/blobs/${layer}`, continent);
+      expect(res.res.headers.get("x-registry-cache")).toBe("primary");
+    }
+    expect((await bindings.REGISTRY_CACHE_EU!.list({ prefix: "cached-asia/" })).objects.length).toBe(0);
+    expect((await bindings.REGISTRY_CACHE_US!.list({ prefix: "cached-asia/" })).objects.length).toBe(0);
+  });
+
+  test("manifests by digest are cached, tags always go to the primary bucket", async () => {
+    const bindings = env as Env;
+    const { sha256: first } = await createManifest("cached-tag", await generateManifest("cached-tag"), "latest");
+
+    for (let i = 0; i < 2; i++) {
+      const byTag = await regionalFetch("GET", `/v2/cached-tag/manifests/latest`, "EU");
+      expect(byTag.res.headers.get("x-registry-cache")).toBe("primary");
+      expect(byTag.res.headers.get("docker-content-digest")).toBe(first);
+      const headByTag = await regionalFetch("HEAD", `/v2/cached-tag/manifests/latest`, "EU");
+      expect(headByTag.res.headers.get("x-registry-cache")).toBe("primary");
+    }
+    expect(await bindings.REGISTRY_CACHE_EU!.head(`cached-tag/manifests/latest`)).toBeNull();
+
+    const miss = await regionalFetch("GET", `/v2/cached-tag/manifests/${first}`, "EU");
+    expect(miss.res.headers.get("x-registry-cache")).toBe("miss");
+    const hit = await regionalFetch("GET", `/v2/cached-tag/manifests/${first}`, "EU");
+    expect(hit.res.headers.get("x-registry-cache")).toBe("hit");
+    expect(hit.res.headers.get("content-type")).toBe(miss.res.headers.get("content-type"));
+    expect(hit.res.headers.get("docker-content-digest")).toBe(first);
+    expect(hit.body).toBe(miss.body);
+    const headHit = await regionalFetch("HEAD", `/v2/cached-tag/manifests/${first}`, "EU");
+    expect(headHit.res.headers.get("x-registry-cache")).toBe("hit");
+    expect(headHit.res.headers.get("content-type")).toBe(miss.res.headers.get("content-type"));
+
+    // A new release moves the tag, the regional client has to see it immediately
+    const { sha256: second } = await createManifest("cached-tag", await generateManifest("cached-tag"), "latest");
+    expect(second).not.toBe(first);
+    const moved = await regionalFetch("GET", `/v2/cached-tag/manifests/latest`, "EU");
+    expect(moved.res.headers.get("docker-content-digest")).toBe(second);
+  });
+
+  test("big objects fill the cache with a separate read", async () => {
+    const bindings = env as Env;
+    const manifest = await generateManifest("cached-big");
+    await createManifest("cached-big", manifest, "latest");
+    const layer = getLayersFromManifest(manifest)[1];
+    const primary = await (await bindings.REGISTRY.get(`cached-big/blobs/${layer}`))!.text();
+
+    const miss = await regionalFetch("GET", `/v2/cached-big/blobs/${layer}`, "NA", { CACHE_TEE_MAX_BYTES: "0" });
+    expect(miss.res.headers.get("x-registry-cache")).toBe("miss");
+    expect(miss.body).toBe(primary);
+    expect(await (await bindings.REGISTRY_CACHE_US!.get(`cached-big/blobs/${layer}`))!.text()).toBe(primary);
+  });
+
+  test("mounted layers are cached with their resolved content", async () => {
+    const bindings = env as Env;
+    const manifest = await generateManifest("cached-source");
+    await createManifest("cached-source", manifest, "latest");
+    expect(await mountLayersFromManifest("cached-source", manifest, "cached-mounted")).toBeGreaterThan(0);
+    const layer = getLayersFromManifest(manifest)[1];
+    const primary = await (await bindings.REGISTRY.get(`cached-source/blobs/${layer}`))!.text();
+
+    const miss = await regionalFetch("GET", `/v2/cached-mounted/blobs/${layer}`, "EU");
+    expect(miss.body).toBe(primary);
+    const hit = await regionalFetch("GET", `/v2/cached-mounted/blobs/${layer}`, "EU");
+    expect(hit.res.headers.get("x-registry-cache")).toBe("hit");
+    expect(hit.body).toBe(primary);
+  });
+
+  test("deletes and garbage collection invalidate the regional caches", async () => {
+    const bindings = env as Env;
+    const manifest = await generateManifest("cached-delete");
+    const { sha256 } = await createManifest("cached-delete", manifest, "latest");
+    const layers = getLayersFromManifest(manifest);
+
+    for (const continent of ["EU", "NA"]) {
+      await regionalFetch("GET", `/v2/cached-delete/manifests/${sha256}`, continent);
+      for (const layer of layers) {
+        await regionalFetch("GET", `/v2/cached-delete/blobs/${layer}`, continent);
+      }
+    }
+    for (const bucket of [bindings.REGISTRY_CACHE_EU!, bindings.REGISTRY_CACHE_US!]) {
+      expect((await bucket.list({ prefix: "cached-delete/" })).objects.length).toBeGreaterThan(0);
+    }
+
+    const del = await fetch(createRequest("DELETE", `/v2/cached-delete/manifests/${sha256}`, null));
+    expect(del.status).toBe(202);
+    for (const bucket of [bindings.REGISTRY_CACHE_EU!, bindings.REGISTRY_CACHE_US!]) {
+      expect(await bucket.head(`cached-delete/manifests/${sha256}`)).toBeNull();
+    }
+
+    const delBlob = await fetch(createRequest("DELETE", `/v2/cached-delete/blobs/${layers[0]}`, null));
+    expect(delBlob.status).toBe(202);
+    for (const bucket of [bindings.REGISTRY_CACHE_EU!, bindings.REGISTRY_CACHE_US!]) {
+      expect(await bucket.head(`cached-delete/blobs/${layers[0]}`)).toBeNull();
+    }
+
+    const gc = await fetch(createRequest("POST", `/v2/cached-delete/gc?mode=unreferenced`, null));
+    expect(gc.ok).toBeTruthy();
+    for (const bucket of [bindings.REGISTRY_CACHE_EU!, bindings.REGISTRY_CACHE_US!]) {
+      expect((await bucket.list({ prefix: "cached-delete/" })).objects.length).toBe(0);
+    }
+  });
+
+  test("pushes never touch the regional caches", async () => {
+    const bindings = env as Env;
+    await createManifest("cached-push", await generateManifest("cached-push"), "latest");
+    expect((await bindings.REGISTRY_CACHE_EU!.list({ prefix: "cached-push/" })).objects.length).toBe(0);
+    expect((await bindings.REGISTRY_CACHE_US!.list({ prefix: "cached-push/" })).objects.length).toBe(0);
   });
 });
 

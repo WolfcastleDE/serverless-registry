@@ -8,6 +8,7 @@ import v2Router from "./src/router";
 import { authenticationMethodFromEnv } from "./src/authentication-method";
 import { Registry } from "./src/registry/registry";
 import { R2Registry } from "./src/registry/r2";
+import { RegionalCache } from "./src/registry/regional-cache";
 
 // A full compatibility mode means that the r2 registry will try its best to
 // help the client on the layer push. See how we let the client push layers with chunked uploads for more information.
@@ -15,6 +16,11 @@ type PushCompatibilityMode = "full" | "none";
 
 export interface Env {
   REGISTRY: R2Bucket;
+  // Regional read-through caches in front of REGISTRY (see src/registry/regional-cache.ts)
+  REGISTRY_CACHE_EU?: R2Bucket;
+  REGISTRY_CACHE_US?: R2Bucket;
+  // Objects up to this size fill the cache via tee(), bigger ones via a second read. Default 64 MiB.
+  CACHE_TEE_MAX_BYTES?: string;
   ENVIRONMENT: string;
   JWT_REGISTRY_TOKENS_PUBLIC_KEY?: string;
   USERNAME?: string;
@@ -52,7 +58,9 @@ export default {
       return new AuthErrorResponse(request);
     }
 
-    env.REGISTRY_CLIENT = new R2Registry(env);
+    // Only reads are served from the regional cache, pushes always go to the primary bucket
+    const readOnly = request.method === "GET" || request.method === "HEAD";
+    env.REGISTRY_CLIENT = new R2Registry(env, readOnly ? RegionalCache.fromRequest(env, request, context) : undefined);
     try {
       // Dispatch the request to the appropriate route
       const res = await router.fetch(request, env, context);
