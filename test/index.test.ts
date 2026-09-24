@@ -2684,6 +2684,40 @@ describe("regional cache", () => {
     }
   });
 
+  test("sparse indexes can be pushed when only some platforms are mirrored", async () => {
+    const name = "sparse-index";
+    const amd = await generateManifest(name);
+    const { sha256: amdDigest } = await createManifest(name, amd);
+    const missing = `sha256:${"f".repeat(64)}`;
+    const index = {
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.index.v1+json",
+      manifests: [
+        {
+          mediaType: "application/vnd.oci.image.manifest.v1+json",
+          digest: amdDigest,
+          size: JSON.stringify(amd).length,
+          platform: { os: "linux", architecture: "amd64" },
+        },
+        {
+          mediaType: "application/vnd.oci.image.manifest.v1+json",
+          digest: missing,
+          size: 123,
+          platform: { os: "windows", architecture: "amd64" },
+        },
+      ],
+    };
+    const put = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/latest`, new Blob([JSON.stringify(index)]).stream(), {
+        "Content-Type": "application/vnd.oci.image.index.v1+json",
+      }),
+    );
+    expect(put.status).toBe(201);
+    expect(put.headers.get("docker-content-digest")).toBe(await getSHA256(JSON.stringify(index)));
+    expect((await fetch(createRequest("GET", `/v2/${name}/manifests/${amdDigest}`, null))).status).toBe(200);
+    expect((await fetch(createRequest("GET", `/v2/${name}/manifests/${missing}`, null))).status).toBe(404);
+  });
+
   test("replicate copies blobs and manifests into every cache bucket", async () => {
     const bindings = env as Env;
     const manifest = await generateManifest("replicated");

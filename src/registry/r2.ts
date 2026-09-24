@@ -377,15 +377,10 @@ export class R2Registry implements Registry {
 
   async verifyManifest(name: string, manifest: ManifestSchema) {
     if (manifest.schemaVersion === 2 && "manifests" in manifest) {
-      for (const manifestElement of manifest.manifests) {
-        const key = manifestElement.digest;
-        const res = await this.env.REGISTRY.head(`${name}/manifests/${key}`);
-        if (res === null) {
-          console.error(`Manifest with digest ${key} doesn't exist`);
-          return new ManifestError("BLOB_UNKNOWN", `unknown manifest ${key}`);
-        }
-      }
-
+      // Sparse indexes are allowed: when only some platforms of an image are mirrored (regsync
+      // `platforms`), the original index is pushed unchanged so its digest stays the one upstream
+      // has, and the manifests of the other platforms simply do not exist here. Pulling one of
+      // those platforms fails with MANIFEST_UNKNOWN.
       return null;
     }
 
