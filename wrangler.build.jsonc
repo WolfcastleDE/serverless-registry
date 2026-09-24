@@ -1,0 +1,30 @@
+// Build and local development config of the fork.
+//
+// Production is NOT deployed with wrangler: registry-infra builds the bundle with
+// `pnpm build` (dist/index.js) and deploys it with Terraform, which also owns all
+// bindings and secrets. Keep compatibility_date/compatibility_flags in sync with
+// registry-infra/terraform/main.tf.
+{
+  "name": "container-registry",
+  "main": "./index.ts",
+  "compatibility_date": "2026-08-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+
+  "env": {
+    // `pnpm dev` - local R2 buckets simulated by miniflare
+    "dev": {
+      "r2_buckets": [
+        { "binding": "REGISTRY", "bucket_name": "container-registry-dev" },
+        { "binding": "REGISTRY_CACHE_EU", "bucket_name": "container-registry-dev-eu" },
+        { "binding": "REGISTRY_CACHE_US", "bucket_name": "container-registry-dev-us" },
+      ],
+      "vars": {
+        // Test credential for local pushes/pulls. JWT_REGISTRY_TOKENS_PUBLIC_KEY can be put
+        // into .dev.vars to test token auth locally instead (see registry-infra/scripts/make-token.ts).
+        "USERNAME": "hello",
+        "PASSWORD": "world",
+      },
+    },
+  },
+}

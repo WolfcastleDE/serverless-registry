@@ -8,3 +8,4 @@ bun.lockb
 
 # Caches
 *.tsbuildinfo
+dist

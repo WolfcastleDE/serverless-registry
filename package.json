@@ -6,6 +6,8 @@
   "main": "index.ts",
   "scripts": {
     "deploy": "wrangler deploy --minify --env production",
+    "build": "wrangler deploy --dry-run --minify --outdir dist --config wrangler.build.jsonc --env=\"\"",
+    "dev": "wrangler dev --config wrangler.build.jsonc --env dev --port 9999",
     "dev:miniflare": "wrangler dev --env dev --port 9999 --live-reload",
     "generate-types": "wrangler types --config test/wrangler.test.jsonc --include-env=false",
     "generate-types:check": "wrangler types --config test/wrangler.test.jsonc --include-env=false --check",
