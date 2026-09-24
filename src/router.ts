@@ -18,7 +18,7 @@ import {
   registries,
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
-import { ociImageIndexContentType } from "./registry/r2";
+import { R2Registry, ociImageIndexContentType } from "./registry/r2";
 import { CacheStatus, cacheStatusHeader, invalidateCaches } from "./registry/regional-cache";
 
 // Responses that came from a fallback registry (REGISTRIES_JSON) instead of our buckets
@@ -717,6 +717,29 @@ v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {
       "Content-Length": "None",
     },
   });
+});
+
+// Write-through into the regional caches, called by the mirror job after every sync so the first
+// pull in Europe or America is not a cold one. Needs the push capability (POST).
+v2Router.post("/:name+/:kind/:digest/replicate", async (req, env: Env) => {
+  const { name, kind, digest } = req.params;
+  if ((kind !== "blobs" && kind !== "manifests") || !isValidDigest(digest)) {
+    throw new ServerError("expected /v2/<name>/blobs|manifests/<digest>/replicate", 400);
+  }
+  if (!(env.REGISTRY_CLIENT instanceof R2Registry)) {
+    throw new ServerError("replication needs the R2 registry", 500);
+  }
+
+  const result = await env.REGISTRY_CLIENT.replicate(name, kind, digest);
+  if (result === null) {
+    return new Response(JSON.stringify(kind === "blobs" ? BlobUnknownError : ManifestUnknownError(digest)), {
+      status: 404,
+      headers: jsonHeaders(),
+    });
+  }
+
+  const failed = Object.values(result).includes("failed");
+  return new Response(JSON.stringify(result), { status: failed ? 500 : 200, headers: jsonHeaders() });
 });
 
 v2Router.post("/:name+/gc", async (req, env: Env) => {

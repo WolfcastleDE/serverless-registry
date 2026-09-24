@@ -31,7 +31,7 @@ import {
 } from "./registry";
 import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
 import { ManifestSchema, manifestSchema } from "../manifest";
-import { RegionalCache } from "./regional-cache";
+import { RegionalCache, ReplicationStatus, replicateToCaches } from "./regional-cache";
 
 export const ociImageIndexContentType = "application/vnd.oci.image.index.v1+json";
 
@@ -754,6 +754,33 @@ export class R2Registry implements Registry {
       return "response" in again ? null : again.stream;
     });
     return { ...res, stream, cacheStatus: "miss" };
+  }
+
+  // Write-through: copies a blob or a manifest (by digest) from the primary bucket into every
+  // regional cache bucket. Returns null if the object does not exist.
+  async replicate(
+    name: string,
+    kind: "blobs" | "manifests",
+    digest: string,
+  ): Promise<Record<string, ReplicationStatus> | null> {
+    const key = `${name}/${kind}/${digest}`;
+    return replicateToCaches(this.env, key, async () => {
+      if (kind === "blobs") {
+        const layer = await this.getLayerFromPrimary(name, digest);
+        return "response" in layer ? null : layer;
+      }
+
+      const manifest = await this.env.REGISTRY.get(key);
+      if (manifest === null) {
+        return null;
+      }
+      return {
+        stream: manifest.body,
+        digest: hexToDigest(manifest.checksums.sha256!),
+        size: manifest.size,
+        contentType: manifest.httpMetadata?.contentType,
+      };
+    });
   }
 
   private async getLayerFromPrimary(name: string, digest: string): Promise<RegistryError | GetLayerResponse> {

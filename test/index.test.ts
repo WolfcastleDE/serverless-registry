@@ -2684,6 +2684,58 @@ describe("regional cache", () => {
     }
   });
 
+  test("replicate copies blobs and manifests into every cache bucket", async () => {
+    const bindings = env as Env;
+    const manifest = await generateManifest("replicated");
+    const { sha256 } = await createManifest("replicated", manifest, "latest");
+    const layer = getLayersFromManifest(manifest)[1];
+    const primary = await (await bindings.REGISTRY.get(`replicated/blobs/${layer}`))!.text();
+
+    const first = await fetch(createRequest("POST", `/v2/replicated/blobs/${layer}/replicate`, null));
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ REGISTRY_CACHE_EU: "copied", REGISTRY_CACHE_US: "copied" });
+    const second = await fetch(createRequest("POST", `/v2/replicated/blobs/${layer}/replicate`, null));
+    expect(await second.json()).toEqual({ REGISTRY_CACHE_EU: "present", REGISTRY_CACHE_US: "present" });
+
+    const manifestRes = await fetch(createRequest("POST", `/v2/replicated/manifests/${sha256}/replicate`, null));
+    expect(await manifestRes.json()).toEqual({ REGISTRY_CACHE_EU: "copied", REGISTRY_CACHE_US: "copied" });
+
+    for (const continent of ["EU", "NA"]) {
+      const blob = await regionalFetch("GET", `/v2/replicated/blobs/${layer}`, continent);
+      expect(blob.res.headers.get("x-registry-cache")).toBe("hit");
+      expect(blob.body).toBe(primary);
+      const head = await regionalFetch("HEAD", `/v2/replicated/manifests/${sha256}`, continent);
+      expect(head.res.headers.get("x-registry-cache")).toBe("hit");
+      expect(head.res.headers.get("docker-content-digest")).toBe(sha256);
+      expect(head.res.headers.get("content-type")).toBeTruthy();
+    }
+  });
+
+  test("replicate resolves mounted layers and validates its input", async () => {
+    const bindings = env as Env;
+    const manifest = await generateManifest("replicate-source");
+    await createManifest("replicate-source", manifest, "latest");
+    await mountLayersFromManifest("replicate-source", manifest, "replicate-mounted");
+    const layer = getLayersFromManifest(manifest)[1];
+    const primary = await (await bindings.REGISTRY.get(`replicate-source/blobs/${layer}`))!.text();
+
+    const res = await fetch(createRequest("POST", `/v2/replicate-mounted/blobs/${layer}/replicate`, null));
+    expect(res.status).toBe(200);
+    expect(await (await bindings.REGISTRY_CACHE_EU!.get(`replicate-mounted/blobs/${layer}`))!.text()).toBe(primary);
+
+    const missing = `sha256:${"0".repeat(64)}`;
+    expect((await fetch(createRequest("POST", `/v2/replicated/blobs/${missing}/replicate`, null))).status).toBe(404);
+    expect((await fetch(createRequest("POST", `/v2/replicated/manifests/${missing}/replicate`, null))).status).toBe(
+      404,
+    );
+    expect((await fetch(createRequest("POST", `/v2/replicated/manifests/latest/replicate`, null))).status).toBe(400);
+    expect((await fetch(createRequest("POST", `/v2/replicated/tags/${missing}/replicate`, null))).status).toBe(400);
+    // needs credentials
+    expect((await fetchUnauth(createRequest("POST", `/v2/replicated/blobs/${layer}/replicate`, null))).status).toBe(
+      401,
+    );
+  });
+
   test("pushes never touch the regional caches", async () => {
     const bindings = env as Env;
     await createManifest("cached-push", await generateManifest("cached-push"), "latest");

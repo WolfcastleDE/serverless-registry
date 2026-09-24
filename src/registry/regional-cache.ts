@@ -24,6 +24,8 @@ const continentToCache: Record<string, keyof RegionalCacheBindings> = {
   SA: "REGISTRY_CACHE_US",
 };
 
+const cacheBindingNames = ["REGISTRY_CACHE_EU", "REGISTRY_CACHE_US"] as const;
+
 type RegionalCacheBindings = {
   REGISTRY_CACHE_EU?: R2Bucket;
   REGISTRY_CACHE_US?: R2Bucket;
@@ -50,7 +52,7 @@ export type CachedHead = {
 
 // Every regional cache bucket, independent of the request's location. Used to invalidate.
 export function allCacheBuckets(env: Env): R2Bucket[] {
-  return [env.REGISTRY_CACHE_EU, env.REGISTRY_CACHE_US].filter((b): b is R2Bucket => b !== undefined);
+  return cacheBindingNames.map((name) => env[name]).filter((b): b is R2Bucket => b !== undefined);
 }
 
 // Deletes keys from every regional cache bucket. Errors are logged, not thrown: a stale
@@ -87,6 +89,81 @@ export function isCacheableKey(key: string): boolean {
 
   const reference = key.substring(key.indexOf("/", index + 1) + 1);
   return isValidDigest(reference);
+}
+
+type ObjectInfo = { digest: string; size: number; contentType?: string };
+
+// Writes an object read from the primary bucket into a cache bucket. Throws on failure.
+async function writeCached(bucket: R2Bucket, key: string, source: ReadableStream, object: ObjectInfo): Promise<void> {
+  const metadata: CachedObjectMetadata = { digest: object.digest };
+  if (object.contentType) {
+    metadata.contentType = object.contentType;
+  }
+
+  // R2 needs to know the length of a streamed body upfront
+  const fixed = new FixedLengthStream(object.size);
+  const [pipeErr, putErr] = await Promise.all([
+    source.pipeTo(fixed.writable).then(
+      () => undefined,
+      (e: unknown) => e,
+    ),
+    bucket
+      .put(key, fixed.readable, {
+        ...(object.digest.startsWith("sha256:") ? { sha256: object.digest.substring("sha256:".length) } : {}),
+        httpMetadata: object.contentType ? { contentType: object.contentType } : undefined,
+        customMetadata: metadata,
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      ),
+  ]);
+  if (putErr !== undefined || pipeErr !== undefined) {
+    throw putErr ?? pipeErr;
+  }
+}
+
+export type ReplicationStatus = "present" | "copied" | "failed";
+
+// Copies an object from the primary bucket into every regional cache bucket that does not have
+// it yet (write-through). Unlike the read-through fill this runs inside the request, so it is not
+// bound by the time limit of waitUntil() and also works for objects the primary bucket is slow to
+// serve to that region.
+//
+// `read` returns a fresh stream of the object from the primary bucket, or null if it is gone.
+export async function replicateToCaches(
+  env: Env,
+  key: string,
+  read: () => Promise<(ObjectInfo & { stream: ReadableStream }) | null>,
+): Promise<Record<string, ReplicationStatus> | null> {
+  const result: Record<string, ReplicationStatus> = {};
+  for (const name of cacheBindingNames) {
+    const bucket = env[name];
+    if (bucket === undefined) {
+      continue;
+    }
+
+    const existing = await bucket.head(key);
+    if (existing !== null && existing.customMetadata?.digest) {
+      result[name] = "present";
+      continue;
+    }
+
+    const object = await read();
+    if (object === null) {
+      return null;
+    }
+
+    try {
+      await writeCached(bucket, key, object.stream, object);
+      result[name] = "copied";
+    } catch (err) {
+      console.error(`Replicating ${key} into ${name} failed:`, errorString(err));
+      result[name] = "failed";
+    }
+  }
+
+  return result;
 }
 
 export class RegionalCache {
@@ -176,7 +253,7 @@ export class RegionalCache {
   fill(
     key: string,
     stream: ReadableStream,
-    object: { digest: string; size: number; contentType?: string },
+    object: ObjectInfo,
     refetch: () => Promise<ReadableStream | null>,
   ): ReadableStream {
     if (!this.applies(key)) {
@@ -184,26 +261,10 @@ export class RegionalCache {
     }
 
     const bucket = this.bucket!;
-    const metadata: CachedObjectMetadata = { digest: object.digest };
-    if (object.contentType) {
-      metadata.contentType = object.contentType;
-    }
-
     const write = async (source: ReadableStream) => {
-      // R2 needs to know the length of a streamed body upfront
-      const fixed = new FixedLengthStream(object.size);
-      const [, err] = await Promise.all([
-        source.pipeTo(fixed.writable).catch((e: unknown) => e),
-        bucket
-          .put(key, fixed.readable, {
-            ...(object.digest.startsWith("sha256:") ? { sha256: object.digest.substring("sha256:".length) } : {}),
-            httpMetadata: object.contentType ? { contentType: object.contentType } : undefined,
-            customMetadata: metadata,
-          })
-          .then(() => undefined)
-          .catch((e: unknown) => e),
-      ]);
-      if (err !== undefined) {
+      try {
+        await writeCached(bucket, key, source, object);
+      } catch (err) {
         console.error(`Filling regional cache for ${key} failed:`, errorString(err));
       }
     };
